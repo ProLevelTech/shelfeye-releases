@@ -5,7 +5,11 @@ set -euo pipefail
 DOWNLOAD_URL="${SHELFEYE_DOWNLOAD_URL:-https://github.com/ProLevelTech/shelfeye-releases/releases/latest/download/shelfeye.tar.gz}"
 INSTALL_DIR="/opt/shelfeye"
 DATA_DIR="/opt/shelfeye-data"
-UV_BIN="/home/pi/.local/bin/uv"
+
+# Determine the real user who invoked sudo (falls back to current user)
+REAL_USER="${SUDO_USER:-${USER}}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+UV_BIN="${REAL_HOME}/.local/bin/uv"
 # ──────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
@@ -19,7 +23,7 @@ command -v curl >/dev/null || error "curl not found. Run: sudo apt-get install -
 # ─── Install uv ───────────────────────────────────────────────────────────────
 if [[ ! -x "$UV_BIN" ]]; then
     info "Installing uv..."
-    sudo -u pi bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+    sudo -u "$REAL_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
     [[ -x "$UV_BIN" ]] || error "uv install failed, expected at $UV_BIN"
 else
     info "uv already installed: $($UV_BIN --version)"
@@ -78,7 +82,7 @@ tar -xzf "$TMP_DIR/shelfeye.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
 # ─── Install Python dependencies ──────────────────────────────────────────────
 info "Installing Python dependencies..."
 cd "$INSTALL_DIR"
-sudo -u pi "$UV_BIN" sync --no-dev
+sudo -u "$REAL_USER" "$UV_BIN" sync --no-dev
 
 # ─── Data directory & .env ───────────────────────────────────────────────────
 info "Setting up data directory at $DATA_DIR..."
@@ -96,7 +100,7 @@ else
     info ".env already exists at $DATA_DIR/.env — skipping"
 fi
 
-chown -R pi:pi "$DATA_DIR"
+chown -R "$REAL_USER:$REAL_USER" "$DATA_DIR"
 
 # ─── Configure environment ────────────────────────────────────────────────────
 set_env() {
