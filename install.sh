@@ -8,7 +8,9 @@ DATA_DIR="/opt/shelfeye-data"
 
 # Determine the real user who invoked sudo (falls back to current user)
 REAL_USER="${SUDO_USER:-${USER}}"
+[[ -z "$REAL_USER" || "$REAL_USER" == "root" ]] && error "Cannot determine the target user. Run via: sudo bash install.sh (not as root directly)"
 REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+[[ -z "$REAL_HOME" ]] && error "Cannot determine home directory for user '$REAL_USER'"
 UV_BIN="${REAL_HOME}/.local/bin/uv"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -23,7 +25,7 @@ command -v curl >/dev/null || error "curl not found. Run: sudo apt-get install -
 # ─── Install uv ───────────────────────────────────────────────────────────────
 if [[ ! -x "$UV_BIN" ]]; then
     info "Installing uv..."
-    sudo -u "$REAL_USER" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" bash -c 'curl -LsSf https://astral.sh/uv/install.sh | sh'
     [[ -x "$UV_BIN" ]] || error "uv install failed, expected at $UV_BIN"
 else
     info "uv already installed: $($UV_BIN --version)"
@@ -35,8 +37,8 @@ info "Checking camera drivers..."
 DRIVER_OK=true
 
 # libcamera stack
-if ! command -v libcamera-hello >/dev/null 2>&1; then
-    warn "libcamera-hello not found — install: sudo apt-get install -y libcamera-apps"
+if ! command -v rpicam-hello >/dev/null 2>&1; then
+    warn "rpicam-hello not found — install: sudo apt-get install -y libcamera-apps"
     DRIVER_OK=false
 fi
 
@@ -53,8 +55,8 @@ if ! grep -qE "^(camera_auto_detect=1|dtoverlay=imx708)" /boot/firmware/config.t
 fi
 
 # Check at least one camera is detected by libcamera
-if command -v libcamera-hello >/dev/null 2>&1; then
-    CAM_COUNT=$(libcamera-hello --list-cameras 2>&1 | grep -c "^\s*[0-9]" || true)
+if command -v rpicam-hello >/dev/null 2>&1; then
+    CAM_COUNT=$(rpicam-hello --list 2>&1 | grep -c "^\s*[0-9]" || true)
     if [[ "$CAM_COUNT" -eq 0 ]]; then
         warn "No cameras detected by libcamera. Check hardware connections."
         DRIVER_OK=false
@@ -78,6 +80,7 @@ curl -fsSL "$DOWNLOAD_URL" -o "$TMP_DIR/shelfeye.tar.gz"
 info "Extracting to $INSTALL_DIR..."
 mkdir -p "$INSTALL_DIR"
 tar -xzf "$TMP_DIR/shelfeye.tar.gz" --strip-components=1 -C "$INSTALL_DIR"
+chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
 
 # ─── Install Python dependencies ──────────────────────────────────────────────
 info "Installing Python dependencies..."
@@ -141,8 +144,13 @@ fi
 
 # ─── Systemd services ─────────────────────────────────────────────────────────
 info "Installing systemd services..."
-cp "$INSTALL_DIR/deploy/shelfeye.service" /etc/systemd/system/
-cp "$INSTALL_DIR/deploy/shelfeye-updater.service" /etc/systemd/system/
+for svc in shelfeye.service shelfeye-updater.service; do
+    cp "$INSTALL_DIR/deploy/$svc" /etc/systemd/system/
+    # Inject User= into [Service] section so the service runs as $REAL_USER
+    if ! grep -q "^User=" /etc/systemd/system/"$svc"; then
+        sed -i "s/^\[Service\]/[Service]\nUser=${REAL_USER}/" /etc/systemd/system/"$svc"
+    fi
+done
 systemctl daemon-reload
 systemctl enable shelfeye shelfeye-updater
 systemctl restart shelfeye shelfeye-updater
