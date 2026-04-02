@@ -85,7 +85,8 @@ chown -R "$REAL_USER:$REAL_USER" "$INSTALL_DIR"
 # ─── Install Python dependencies ──────────────────────────────────────────────
 info "Installing Python dependencies..."
 cd "$INSTALL_DIR"
-sudo -u "$REAL_USER" "$UV_BIN" sync --no-dev
+sudo -u "$REAL_USER" HOME="$REAL_HOME" "$UV_BIN" venv --system-site-packages
+sudo -u "$REAL_USER" HOME="$REAL_HOME" "$UV_BIN" sync --frozen --no-dev
 
 # ─── Data directory & .env ───────────────────────────────────────────────────
 info "Setting up data directory at $DATA_DIR..."
@@ -121,7 +122,7 @@ prompt_env() {
     current=$(grep "^${key}=" "$DATA_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
     printf "  %-30s [%s]: " "$label" "$current"
     local val
-    read -r val </dev/tty
+    read -r val </dev/tty || true
     [[ -n "$val" ]] && set_env "$key" "$val"
 }
 
@@ -133,7 +134,7 @@ prompt_env "SHELFEYE_API_KEY"     "API key"
 prompt_env "SHELFEYE_SSE_API_KEY" "SSE API key"
 
 printf "  %-30s [y/N]: " "Enable S3 storage?"
-read -r s3_enable </dev/tty
+read -r s3_enable </dev/tty || true
 if [[ "$s3_enable" =~ ^[Yy]$ ]]; then
     set_env "SHELFEYE_S3_ENABLED" "true"
     prompt_env "SHELFEYE_S3_URL"        "S3 endpoint URL"
@@ -141,6 +142,33 @@ if [[ "$s3_enable" =~ ^[Yy]$ ]]; then
     prompt_env "SHELFEYE_S3_SECRET_KEY" "S3 secret key"
     prompt_env "SHELFEYE_S3_BUCKET"     "S3 bucket name"
 fi
+
+# ─── nginx ───────────────────────────────────────────────────────────────────
+if command -v nginx >/dev/null 2>&1; then
+    info "nginx already installed: $(nginx -v 2>&1)"
+else
+    info "Installing nginx..."
+    apt-get install -y nginx
+fi
+
+NGINX_CONF="/etc/nginx/sites-available/shelfeye"
+info "Configuring nginx..."
+cp "$INSTALL_DIR/deploy/nginx.conf" "$NGINX_CONF"
+
+NGINX_ENABLED="/etc/nginx/sites-enabled/shelfeye"
+if [[ ! -L "$NGINX_ENABLED" ]]; then
+    ln -s "$NGINX_CONF" "$NGINX_ENABLED"
+fi
+
+# Remove default site if it conflicts on port 80
+if [[ -L /etc/nginx/sites-enabled/default ]]; then
+    warn "Removing nginx default site (conflicts on port 80)"
+    rm /etc/nginx/sites-enabled/default
+fi
+
+nginx -t || error "nginx config test failed — check $NGINX_CONF"
+systemctl enable nginx
+systemctl reload nginx
 
 # ─── Systemd services ─────────────────────────────────────────────────────────
 info "Installing systemd services..."
@@ -156,8 +184,21 @@ systemctl enable shelfeye shelfeye-updater
 systemctl restart shelfeye shelfeye-updater
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
+get_env() { grep "^${1}=" "$DATA_DIR/.env" 2>/dev/null | cut -d= -f2- || echo "(not set)"; }
+
 echo ""
 info "Installation complete!"
+echo ""
+echo "  ┌─────────────────────────────────────────┐"
+echo "  │           Current configuration          │"
+echo "  ├─────────────────────────────────────────┤"
+printf "  │  %-20s %s\n" "Server URL:"    "$(get_env SHELFEYE_SERVER_URL)│"
+printf "  │  %-20s %s\n" "Client ID:"     "$(get_env SHELFEYE_CLIENT_ID)│"
+printf "  │  %-20s %s\n" "API Key:"       "$(get_env SHELFEYE_API_KEY)│"
+printf "  │  %-20s %s\n" "SSE API Key:"   "$(get_env SHELFEYE_SSE_API_KEY)│"
+printf "  │  %-20s %s\n" "S3 Enabled:"    "$(get_env SHELFEYE_S3_ENABLED)│"
+echo "  └─────────────────────────────────────────┘"
+echo ""
 info "Check status:  systemctl status shelfeye"
 info "View logs:     journalctl -u shelfeye -f"
 info "Edit config:   $DATA_DIR/.env  (then: systemctl restart shelfeye)"
