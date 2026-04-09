@@ -126,6 +126,9 @@ prompt_env() {
     [[ -n "$val" ]] && set_env "$key" "$val"
 }
 
+# Updater runs as root and needs the absolute path to uv
+set_env "SHELFEYE_UV_BIN" "$UV_BIN"
+
 echo ""
 info "Configure main settings (Enter to keep current value):"
 prompt_env "SHELFEYE_SERVER_URL"  "Backend server URL"
@@ -174,14 +177,47 @@ systemctl reload nginx
 info "Installing systemd services..."
 for svc in shelfeye.service shelfeye-updater.service; do
     cp "$INSTALL_DIR/deploy/$svc" /etc/systemd/system/
-    # Inject User= into [Service] section so the service runs as $REAL_USER
-    if ! grep -q "^User=" /etc/systemd/system/"$svc"; then
-        sed -i "s/^\[Service\]/[Service]\nUser=${REAL_USER}/" /etc/systemd/system/"$svc"
-    fi
 done
+# Main service runs as the real user
+if ! grep -q "^User=" /etc/systemd/system/shelfeye.service; then
+    sed -i "s/^\[Service\]/[Service]\nUser=${REAL_USER}/" /etc/systemd/system/shelfeye.service
+fi
+# Updater service must run as root: it creates dirs in /opt/ and calls systemctl
 systemctl daemon-reload
 systemctl enable shelfeye shelfeye-updater
 systemctl restart shelfeye shelfeye-updater
+
+# ─── Fake-apply migrations for tables created by first startup ────────────────
+# main.py creates tables via create_table(if_not_exists=True) on first run,
+# which bypasses Piccolo's migration history. Fake-mark them so future OTA
+# updates don't fail with "table already exists".
+info "Waiting for shelfeye to initialize database..."
+sleep 5
+
+PICCOLO_BIN="$INSTALL_DIR/.venv/bin/piccolo"
+DB_PATH=$(grep "^SHELFEYE_DB_PATH=" "$DATA_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
+DB_PATH="${DB_PATH:-$DATA_DIR/buffer.db}"
+
+if [[ -f "$PICCOLO_BIN" && -f "$DB_PATH" ]]; then
+    info "Fake-applying initial migrations to record schema history..."
+    PICCOLO_CONF=shelfeye.piccolo_conf \
+    SHELFEYE_DB_PATH="$DB_PATH" \
+    PYTHONPATH="$INSTALL_DIR" \
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" \
+        "$PICCOLO_BIN" migrations forwards models \
+        --migration_id=2026-02-05T16:10:55:928728 --fake \
+        2>/dev/null || true
+    PICCOLO_CONF=shelfeye.piccolo_conf \
+    SHELFEYE_DB_PATH="$DB_PATH" \
+    PYTHONPATH="$INSTALL_DIR" \
+    sudo -u "$REAL_USER" HOME="$REAL_HOME" \
+        "$PICCOLO_BIN" migrations forwards models \
+        --migration_id=2026-02-13T14:23:33:574333 --fake \
+        2>/dev/null || true
+    info "Migration history initialized."
+else
+    warn "Could not initialize migration history (piccolo or DB not found). Will retry on first OTA update."
+fi
 
 # ─── Done ─────────────────────────────────────────────────────────────────────
 get_env() { grep "^${1}=" "$DATA_DIR/.env" 2>/dev/null | cut -d= -f2- || echo "(not set)"; }
