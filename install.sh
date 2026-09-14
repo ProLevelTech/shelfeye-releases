@@ -129,6 +129,36 @@ prompt_env() {
 # Updater runs as root and needs the absolute path to uv
 set_env "SHELFEYE_UV_BIN" "$UV_BIN"
 
+# ─── Migrate a DB left inside the install dir ────────────────────────────────
+# Older installs shipped SHELFEYE_DB_PATH=buffer.db (relative). systemd sets
+# WorkingDirectory=$INSTALL_DIR, so the database landed in the directory an OTA
+# update replaces: the DB left with the backup and the service came back up on
+# an empty one, losing the photo queue and every config_value row. The service
+# now refuses to start on such a path, so fix it here too — an existing .env is
+# otherwise left untouched by this script.
+CURRENT_DB=$(grep "^SHELFEYE_DB_PATH=" "$DATA_DIR/.env" 2>/dev/null | cut -d= -f2- || true)
+if [[ -n "$CURRENT_DB" && "$CURRENT_DB" != /* ]]; then
+    CURRENT_DB="$INSTALL_DIR/$CURRENT_DB"
+fi
+if [[ -n "$CURRENT_DB" && "$CURRENT_DB" == "$INSTALL_DIR/"* ]]; then
+    TARGET_DB="$DATA_DIR/$(basename "$CURRENT_DB")"
+    warn "Database sits inside $INSTALL_DIR and would be lost on the next update."
+    if [[ -f "$CURRENT_DB" ]]; then
+        if [[ -f "$TARGET_DB" ]]; then
+            # Never clobber an existing DB — keep it, park the stray copy.
+            mv "$CURRENT_DB" "${TARGET_DB}.from-install-dir"
+            warn "$TARGET_DB already exists — kept it, saved the other as ${TARGET_DB}.from-install-dir"
+        else
+            for suffix in "" "-wal" "-shm" "-journal"; do
+                [[ -f "${CURRENT_DB}${suffix}" ]] && mv "${CURRENT_DB}${suffix}" "${TARGET_DB}${suffix}"
+            done
+            info "Moved database to $TARGET_DB"
+        fi
+    fi
+    set_env "SHELFEYE_DB_PATH" "$TARGET_DB"
+    info "SHELFEYE_DB_PATH updated to $TARGET_DB"
+fi
+
 echo ""
 info "Configure main settings (Enter to keep current value):"
 prompt_env "SHELFEYE_SERVER_URL"  "Backend server URL"
@@ -163,10 +193,14 @@ if [[ ! -L "$NGINX_ENABLED" ]]; then
     ln -s "$NGINX_CONF" "$NGINX_ENABLED"
 fi
 
-# Remove default site if it conflicts on port 80
-if [[ -L /etc/nginx/sites-enabled/default ]]; then
+# Remove the default site. It claims port 80 as default_server, so a request by
+# IP lands there instead of shelfeye and every /admin/update returns 404 — this
+# is what left a device unreachable for OTA updates. Our config now declares
+# default_server itself, and two of them on one port is a fatal nginx error,
+# so this must go whether it is a symlink or a regular file.
+if [[ -e /etc/nginx/sites-enabled/default || -L /etc/nginx/sites-enabled/default ]]; then
     warn "Removing nginx default site (conflicts on port 80)"
-    rm /etc/nginx/sites-enabled/default
+    rm -f /etc/nginx/sites-enabled/default
 fi
 
 nginx -t || error "nginx config test failed — check $NGINX_CONF"
@@ -238,3 +272,10 @@ echo ""
 info "Check status:  systemctl status shelfeye"
 info "View logs:     journalctl -u shelfeye -f"
 info "Edit config:   $DATA_DIR/.env  (then: systemctl restart shelfeye)"
+
+# Optional, not run here: serving DHCP to a directly attached PC rewrites the
+# network config and is only wanted on some devices, so it stays a separate,
+# deliberate step.
+echo ""
+info "Optional — hand out IPs to a PC on a spare Ethernet port:"
+echo "               sudo bash $INSTALL_DIR/deploy/setup-pc-link.sh --iface eth0"
